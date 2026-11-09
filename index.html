@@ -328,13 +328,21 @@
 
     <div class="label">Datos</div>
     <div class="card">
-      <p class="small" style="margin-top:0;">Tus datos se guardan solo en este navegador. Exportá un respaldo cada tanto para no perderlos.</p>
+      <p class="small" style="margin-top:0;">Tus datos se guardan en este navegador. Si configurás la sincronización, también se copian a tu planilla de Google Sheets. Exportá un respaldo cada tanto igual.</p>
       <div class="row" style="margin-top:6px;">
         <button class="btn ghost" id="exportBtn">Exportar respaldo</button>
         <button class="btn ghost" id="importBtn">Importar respaldo</button>
       </div>
       <input type="file" id="importFile" accept="application/json" style="display:none;">
       <button class="btn danger" id="resetBtn" style="margin-top:10px;">Borrar todos los datos</button>
+    </div>
+
+    <div class="label" style="margin-top:18px;">Sincronización con Google Sheets</div>
+    <div class="card">
+      <div class="field"><label>URL de la Web app</label><input type="text" id="syncUrl" placeholder="https://script.google.com/macros/s/.../exec" autocapitalize="off" autocorrect="off"></div>
+      <div class="field"><label>Token</label><input type="password" id="syncToken" placeholder="El mismo que definiste en el script" autocapitalize="off" autocorrect="off"></div>
+      <button class="btn ghost" id="syncSaveBtn">Guardar y sincronizar</button>
+      <p class="small" id="syncStatus" style="margin-bottom:0;">Sin configurar</p>
     </div>
 
     <details class="help">
@@ -435,9 +443,78 @@ function loadState(){
   if(isClaudeSandbox){ return memStore ? structuredClone(memStore) : null; }
   try{ const raw = localStorage.getItem(KEY); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
 }
-function saveState(){
+function persistLocal(){
   if(isClaudeSandbox){ memStore = structuredClone(state); return; }
   try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){ toast("No se pudo guardar"); }
+}
+function saveState(){
+  state.updatedAt = Date.now();
+  persistLocal();
+  scheduleSync();
+}
+
+/* ===================== SYNC (Google Sheets vía Apps Script) ===================== */
+const SYNC_KEY = "forja_sync_v1";
+let syncTimer = null, syncBusy = false, syncAgain = false, syncForce = false;
+
+function getSyncCfg(){ try{ return JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; }catch(e){ return {}; } }
+function setSyncCfg(c){ try{ localStorage.setItem(SYNC_KEY, JSON.stringify(c)); }catch(e){} }
+function syncEnabled(){ const c=getSyncCfg(); return !!(c.url && c.token); }
+function setSyncStatus(t){ const el=document.getElementById("syncStatus"); if(el) el.textContent=t; }
+
+async function syncCall(action, data){
+  const c = getSyncCfg();
+  // text/plain evita el preflight CORS, que Apps Script no soporta
+  const res = await fetch(c.url, { method:"POST", body: JSON.stringify({ token:c.token, action, data }) });
+  const json = await res.json();
+  if(json.error) throw new Error(json.error);
+  return json;
+}
+
+function scheduleSync(force){
+  if(force) syncForce = true;
+  if(!syncEnabled()) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(runSync, 1500);
+}
+
+function mergeRemote(remote){
+  let changed = false;
+  const have = new Set(state.sessions.map(s=>s.id));
+  remote.sessions.forEach(s=>{ if(!have.has(s.id)){ state.sessions.push(s); changed = true; } });
+  state.sessions.sort((a,b)=>a.date-b.date);
+  const m = remote.meta;
+  if(m && m.routines && (m.updatedAt||0) > (state.updatedAt||0)){
+    state.routines = m.routines;
+    if(m.defaultRest) state.defaultRest = m.defaultRest;
+    state.updatedAt = m.updatedAt;
+    changed = true;
+  }
+  return changed;
+}
+
+async function runSync(){
+  if(!syncEnabled()) return;
+  if(syncBusy){ syncAgain = true; return; }
+  syncBusy = true; setSyncStatus("Sincronizando…");
+  try{
+    const force = syncForce; syncForce = false;
+    if(!force){
+      const remote = await syncCall("pull");
+      if(mergeRemote(remote)){
+        persistLocal();
+        const cur = Object.keys(views).find(k=>views[k].classList.contains("active"));
+        if(cur && cur!=="session") show(cur);
+      }
+    }
+    await syncCall("push", { routines:state.routines, defaultRest:state.defaultRest, updatedAt:state.updatedAt||0, sessions:state.sessions });
+    setSyncStatus("Sincronizado " + new Date().toLocaleTimeString("es-AR",{hour:"2-digit",minute:"2-digit"}));
+  }catch(e){
+    setSyncStatus("Error: " + (e.message||e) + " (se reintenta más tarde)");
+  }finally{
+    syncBusy = false;
+    if(syncAgain){ syncAgain = false; scheduleSync(); }
+  }
 }
 
 /* ===================== DEFAULT DATA ===================== */
@@ -1049,7 +1126,7 @@ document.getElementById("importFile").onchange=function(){
       const data=JSON.parse(e.target.result);
       if(!data.routines||!data.sessions) throw new Error("formato");
       if(confirm("Esto va a reemplazar tus datos actuales. ¿Continuar?")){
-        state=data; saveState(); toast("Datos importados"); show("home");
+        state=data; saveState(); scheduleSync(true); toast("Datos importados"); show("home");
       }
     }catch(err){ toast("Archivo inválido"); }
   };
@@ -1057,9 +1134,24 @@ document.getElementById("importFile").onchange=function(){
 };
 document.getElementById("resetBtn").onclick=()=>{
   if(confirm("¿Borrar TODO? Esto no se puede deshacer. Exportá un respaldo antes si querés conservar tus datos.")){
-    state=defaultState(); saveState(); toast("Datos reiniciados"); show("home");
+    state=defaultState(); saveState(); scheduleSync(true); toast("Datos reiniciados"); show("home");
   }
 };
+
+/* sync settings */
+(function(){
+  const c=getSyncCfg();
+  document.getElementById("syncUrl").value=c.url||"";
+  document.getElementById("syncToken").value=c.token||"";
+  if(c.url&&c.token) setSyncStatus("Configurado");
+  document.getElementById("syncSaveBtn").onclick=()=>{
+    const url=document.getElementById("syncUrl").value.trim();
+    const token=document.getElementById("syncToken").value.trim();
+    setSyncCfg({url,token});
+    if(!url||!token){ setSyncStatus("Sin configurar"); return; }
+    clearTimeout(syncTimer); runSync();
+  };
+})();
 
 /* ===================== UTILS ===================== */
 function esc(s){ return String(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -1077,6 +1169,7 @@ if(isClaudeSandbox){
 
 /* init */
 renderHome();
+if(syncEnabled()) runSync();
 </script>
 </body>
 </html>
