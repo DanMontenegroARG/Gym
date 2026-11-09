@@ -873,6 +873,10 @@ function showSessionDetail(s){
     if(ex.note) txt+="  ("+ex.note+")\n";
   });
   alert(txt);
+  if(confirm("¿Borrar esta sesión? No se puede deshacer.")){
+    state.sessions=state.sessions.filter(x=>x.id!==s.id);
+    saveState(); scheduleSync(true); renderHistory(); toast("Sesión borrada");
+  }
 }
 
 /* ===================== PROGRESS / CHARTS ===================== */
